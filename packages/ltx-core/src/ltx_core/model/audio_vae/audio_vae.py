@@ -267,14 +267,7 @@ def encode_audio(
             n_fft=audio_encoder.n_fft,
         ).to(device=device)
 
-    audio = audio.to(device=device)
-    # Convert mono to stereo by duplicating the channel if needed
-    if audio.waveform.shape[-2] < audio_encoder.in_channels:
-        audio = Audio(
-            waveform=audio.waveform.expand(*audio.waveform.shape[:-2], audio_encoder.in_channels, -1),
-            sampling_rate=audio.sampling_rate,
-        )
-    mel_spectrogram = audio_processor.waveform_to_mel(audio)
+    mel_spectrogram = audio_processor.waveform_to_mel(audio.to(device=device))
 
     latent = audio_encoder(mel_spectrogram.to(dtype=dtype))
     return latent

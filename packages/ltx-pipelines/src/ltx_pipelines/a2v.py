@@ -120,7 +120,13 @@ class TI2VidTwoStagesPipeline:
         decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
         encoded_audio_latent = vae_encode_audio(decoded_audio, self.stage_1_model_ledger.audio_encoder())
         audio_shape = AudioLatentShape.from_duration(batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16)
-        encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
+
+        # Truncate or pad the audio latent to match the target frame count
+        if encoded_audio_latent.shape[2] >= audio_shape.frames:
+            encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
+        else:
+            pad_frames = audio_shape.frames - encoded_audio_latent.shape[2]
+            encoded_audio_latent = torch.nn.functional.pad(encoded_audio_latent, (0, 0, 0, pad_frames))
 
         # Stage 1: encode image conditionings with the VAE encoder, then free it
         # before loading the transformer to reduce peak VRAM.
