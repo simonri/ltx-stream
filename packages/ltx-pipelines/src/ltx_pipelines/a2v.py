@@ -180,6 +180,7 @@ class TI2VidTwoStagesPipeline:
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
+            initial_audio_latent=encoded_audio_latent,
         )
 
         torch.cuda.synchronize()
@@ -247,10 +248,12 @@ class TI2VidTwoStagesPipeline:
         decoded_video = vae_decode_video(
             video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
         )
-        decoded_audio = vae_decode_audio(
-            audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
-        )
-        return decoded_video, decoded_audio
+
+        # Return the original input audio instead of VAE-decoded audio to preserve fidelity.
+        # decode_audio_from_file already returns normalised [-1, 1] float values.
+        original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
+
+        return decoded_video, original_audio
 
 
 @torch.inference_mode()
