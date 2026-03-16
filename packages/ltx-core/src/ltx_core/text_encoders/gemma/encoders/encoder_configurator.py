@@ -159,17 +159,33 @@ def create_and_populate(module: GemmaTextEncoder) -> GemmaTextEncoder:
 
     config = model.config.text_config
     dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    base = config.rope_local_base_freq
+    # Compat: transformers >=4.52 moved rope config into rope_parameters dict
+    rope_params = getattr(config, "rope_parameters", None) or {}
+    sliding = rope_params.get("sliding_attention", {})
+    full = rope_params.get("full_attention", {})
+    base = getattr(config, "rope_local_base_freq", None) or sliding.get("rope_theta", 10000.0)
     local_rope_freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(dtype=torch.float) / dim))
-    inv_freqs, _ = ROPE_INIT_FUNCTIONS[config.rope_scaling["rope_type"]](config)
+    if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict) and "rope_type" in config.rope_scaling:
+        rope_type = config.rope_scaling["rope_type"]
+        inv_freqs, _ = ROPE_INIT_FUNCTIONS[rope_type](config)
+    else:
+        rope_type = full.get("rope_type", "linear")
+        inv_freqs, _ = ROPE_INIT_FUNCTIONS[rope_type](config, layer_type="full_attention")
 
     positions_length = len(v_model.embeddings.position_ids[0])
     position_ids = torch.arange(positions_length, dtype=torch.long, device="cpu").unsqueeze(0)
     v_model.embeddings.register_buffer("position_ids", position_ids)
     embed_scale = torch.tensor(model.config.text_config.hidden_size**0.5, device="cpu")
     l_model.embed_tokens.register_buffer("embed_scale", embed_scale)
-    l_model.rotary_emb_local.register_buffer("inv_freq", local_rope_freqs)
-    l_model.rotary_emb.register_buffer("inv_freq", inv_freqs)
+    # Compat: transformers >=4.52 unified rotary_emb with per-layer-type buffers
+    if hasattr(l_model, "rotary_emb_local"):
+        l_model.rotary_emb_local.register_buffer("inv_freq", local_rope_freqs)
+        l_model.rotary_emb.register_buffer("inv_freq", inv_freqs)
+    else:
+        l_model.rotary_emb.register_buffer("sliding_attention_inv_freq", local_rope_freqs)
+        l_model.rotary_emb.register_buffer("sliding_attention_original_inv_freq", local_rope_freqs.clone())
+        l_model.rotary_emb.register_buffer("full_attention_inv_freq", inv_freqs)
+        l_model.rotary_emb.register_buffer("full_attention_original_inv_freq", inv_freqs.clone())
 
     return module
 
