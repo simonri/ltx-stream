@@ -18,6 +18,9 @@ try:
 except ImportError:
     flash_attn_interface = None
 
+if flash_attn_interface is not None:
+    print("FlashAttention3 is installed")
+
 
 class AttentionCallable(Protocol):
     def __call__(
