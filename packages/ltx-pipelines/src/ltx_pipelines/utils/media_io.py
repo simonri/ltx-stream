@@ -341,6 +341,7 @@ def decode_audio_from_file(
 
     # Convert mono to stereo by duplicating the channel
     if waveform.shape[-2] == 1:
+        print("Converting mono to stereo")
         waveform = waveform.expand(-1, 2, -1).contiguous()
 
     return Audio(waveform=waveform, sampling_rate=sample_rate)

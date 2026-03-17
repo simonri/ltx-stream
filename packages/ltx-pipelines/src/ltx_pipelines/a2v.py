@@ -5,15 +5,14 @@ import torch
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.guiders import (
+    MultiModalGuider,
     MultiModalGuiderFactory,
     MultiModalGuiderParams,
-    create_multimodal_guider_factory,
 )
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
@@ -28,7 +27,7 @@ from ltx_pipelines.utils import (
     encode_prompts,
     euler_denoising_loop,
     get_device,
-    multi_modal_guider_factory_denoising_func,
+    multi_modal_guider_denoising_func,
     simple_denoising_func,
     trace_step,
 )
@@ -92,8 +91,7 @@ class A2VidPipelineTwoStage:
         num_frames: int,
         frame_rate: float,
         num_inference_steps: int,
-        video_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
-        audio_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
+        video_guider_params: MultiModalGuiderParams,
         images: list[ImageConditioningInput],
         audio_path: str,
         audio_start_time: float = 0.0,
@@ -116,7 +114,7 @@ class A2VidPipelineTwoStage:
                 enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
-        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
 
         with trace_step("encode_audio"):
             decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
@@ -125,12 +123,7 @@ class A2VidPipelineTwoStage:
                 batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16
             )
 
-            # Truncate or pad the audio latent to match the target frame count
-            if encoded_audio_latent.shape[2] >= audio_shape.frames:
-                encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
-            else:
-                pad_frames = audio_shape.frames - encoded_audio_latent.shape[2]
-                encoded_audio_latent = torch.nn.functional.pad(encoded_audio_latent, (0, 0, 0, pad_frames))
+            encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
 
         # Stage 1: encode image conditionings with the VAE encoder, then free it
         # before loading the transformer to reduce peak VRAM.
@@ -151,6 +144,7 @@ class A2VidPipelineTwoStage:
                 dtype=dtype,
                 device=self.device,
             )
+        torch.cuda.synchronize()
         del video_encoder
         if SHOULD_CLEANUP_MEMORY:
             cleanup_memory()
@@ -166,14 +160,13 @@ class A2VidPipelineTwoStage:
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper,
-                denoise_fn=multi_modal_guider_factory_denoising_func(
-                    video_guider_factory=create_multimodal_guider_factory(
+                denoise_fn=multi_modal_guider_denoising_func(
+                    video_guider=MultiModalGuider(
                         params=video_guider_params,
                         negative_context=v_context_n,
                     ),
-                    audio_guider_factory=create_multimodal_guider_factory(
-                        params=audio_guider_params,
-                        negative_context=a_context_n,
+                    audio_guider=MultiModalGuider(
+                        params=MultiModalGuiderParams(),
                     ),
                     v_context=v_context_p,
                     a_context=a_context_p,
@@ -195,6 +188,7 @@ class A2VidPipelineTwoStage:
                 initial_audio_latent=encoded_audio_latent,
             )
 
+        torch.cuda.synchronize()
         del transformer
         if SHOULD_CLEANUP_MEMORY:
             cleanup_memory()
@@ -220,6 +214,7 @@ class A2VidPipelineTwoStage:
                 dtype=dtype,
                 device=self.device,
             )
+        torch.cuda.synchronize()
         del video_encoder
         if SHOULD_CLEANUP_MEMORY:
             cleanup_memory()
@@ -268,14 +263,10 @@ class A2VidPipelineTwoStage:
                 video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
             )
 
-        with trace_step("decode_audio"):
-            decoded_audio_output = vae_decode_audio(
-                encoded_audio_latent,
-                self.stage_2_model_ledger.audio_decoder(),
-                self.stage_2_model_ledger.vocoder(),
-            )
+        # Return the original input audio instead of VAE-decoded audio to preserve fidelity.
+        original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
 
-        return decoded_video, decoded_audio_output
+        return decoded_video, original_audio
 
 
 @torch.inference_mode()
