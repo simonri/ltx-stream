@@ -1,5 +1,8 @@
 import gc
 import logging
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import replace
 
 import torch
@@ -31,6 +34,20 @@ from ltx_pipelines.utils.types import (
     DenoisingLoopFunc,
     PipelineComponents,
 )
+
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def trace_step(name: str, sync_cuda: bool = True) -> Generator[None]:
+    """Log wall-clock time for a pipeline step, with optional CUDA sync."""
+    if sync_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    yield
+    if sync_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    logger.info("%s: %.3fs", name, time.perf_counter() - t0)
 
 
 def get_device() -> torch.device:
@@ -72,6 +89,7 @@ def encode_prompts(
     if enhance_first_prompt:
         prompts = list(prompts)
         prompts[0] = generate_enhanced_prompt(text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed)
+        print(f"Enhanced prompt: {prompts[0]}")
     raw_outputs = [text_encoder.encode(p) for p in prompts]
     torch.cuda.synchronize()
     del text_encoder

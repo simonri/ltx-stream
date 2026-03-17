@@ -13,7 +13,6 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
@@ -31,6 +30,7 @@ from ltx_pipelines.utils import (
     get_device,
     multi_modal_guider_factory_denoising_func,
     simple_denoising_func,
+    trace_step,
 )
 from ltx_pipelines.utils.args import ImageConditioningInput, default_2_stage_arg_parser, detect_checkpoint_path
 from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES, detect_params
@@ -106,27 +106,30 @@ class TI2VidTwoStagesPipeline:
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
-        ctx_p, ctx_n = encode_prompts(
-            [prompt, negative_prompt],
-            self.stage_1_model_ledger,
-            enhance_first_prompt=enhance_prompt,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-            enhance_prompt_seed=seed,
-        )
+        with trace_step("encode_prompts"):
+            ctx_p, ctx_n = encode_prompts(
+                [prompt, negative_prompt],
+                self.stage_1_model_ledger,
+                enhance_first_prompt=enhance_prompt,
+                enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+                enhance_prompt_seed=seed,
+            )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
-        # Encode audio
-        decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
-        encoded_audio_latent = vae_encode_audio(decoded_audio, self.stage_1_model_ledger.audio_encoder())
-        audio_shape = AudioLatentShape.from_duration(batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16)
+        with trace_step("encode_audio"):
+            decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
+            encoded_audio_latent = vae_encode_audio(decoded_audio, self.stage_1_model_ledger.audio_encoder())
+            audio_shape = AudioLatentShape.from_duration(
+                batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16
+            )
 
-        # Truncate or pad the audio latent to match the target frame count
-        if encoded_audio_latent.shape[2] >= audio_shape.frames:
-            encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
-        else:
-            pad_frames = audio_shape.frames - encoded_audio_latent.shape[2]
-            encoded_audio_latent = torch.nn.functional.pad(encoded_audio_latent, (0, 0, 0, pad_frames))
+            # Truncate or pad the audio latent to match the target frame count
+            if encoded_audio_latent.shape[2] >= audio_shape.frames:
+                encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
+            else:
+                pad_frames = audio_shape.frames - encoded_audio_latent.shape[2]
+                encoded_audio_latent = torch.nn.functional.pad(encoded_audio_latent, (0, 0, 0, pad_frames))
 
         # Stage 1: encode image conditionings with the VAE encoder, then free it
         # before loading the transformer to reduce peak VRAM.
@@ -137,16 +140,16 @@ class TI2VidTwoStagesPipeline:
             height=height // 2,
             fps=frame_rate,
         )
-        video_encoder = self.stage_1_model_ledger.video_encoder()
-        stage_1_conditionings = combined_image_conditionings(
-            images=images,
-            height=stage_1_output_shape.height,
-            width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
-        torch.cuda.synchronize()
+        with trace_step("stage_1_encode_images"):
+            video_encoder = self.stage_1_model_ledger.video_encoder()
+            stage_1_conditionings = combined_image_conditionings(
+                images=images,
+                height=stage_1_output_shape.height,
+                width=stage_1_output_shape.width,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=self.device,
+            )
         del video_encoder
         cleanup_memory()
 
@@ -176,42 +179,45 @@ class TI2VidTwoStagesPipeline:
                 ),
             )
 
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_1_output_shape,
-            conditionings=stage_1_conditionings,
-            noiser=noiser,
-            sigmas=sigmas,
-            stepper=stepper,
-            denoising_loop_fn=first_stage_denoising_loop,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
-            initial_audio_latent=encoded_audio_latent,
-        )
+        with trace_step("stage_1_denoise"):
+            video_state, audio_state = denoise_audio_video(
+                output_shape=stage_1_output_shape,
+                conditionings=stage_1_conditionings,
+                noiser=noiser,
+                sigmas=sigmas,
+                stepper=stepper,
+                denoising_loop_fn=first_stage_denoising_loop,
+                components=self.pipeline_components,
+                dtype=dtype,
+                device=self.device,
+                initial_audio_latent=encoded_audio_latent,
+            )
 
-        torch.cuda.synchronize()
         del transformer
         cleanup_memory()
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
-        video_encoder = self.stage_1_model_ledger.video_encoder()
-        upscaled_video_latent = upsample_video(
-            latent=video_state.latent[:1],
-            video_encoder=video_encoder,
-            upsampler=self.stage_2_model_ledger.spatial_upsampler(),
-        )
+        with trace_step("stage_2_upsample"):
+            video_encoder = self.stage_1_model_ledger.video_encoder()
+            upscaled_video_latent = upsample_video(
+                latent=video_state.latent[:1],
+                video_encoder=video_encoder,
+                upsampler=self.stage_2_model_ledger.spatial_upsampler(),
+            )
 
-        stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-        stage_2_conditionings = combined_image_conditionings(
-            images=images,
-            height=stage_2_output_shape.height,
-            width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
+        with trace_step("stage_2_encode_images"):
+            stage_2_output_shape = VideoPixelShape(
+                batch=1, frames=num_frames, width=width, height=height, fps=frame_rate
+            )
+            stage_2_conditionings = combined_image_conditionings(
+                images=images,
+                height=stage_2_output_shape.height,
+                width=stage_2_output_shape.width,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=self.device,
+            )
         del video_encoder
-        torch.cuda.synchronize()
         cleanup_memory()
 
         transformer = self.stage_2_model_ledger.transformer()
@@ -232,28 +238,29 @@ class TI2VidTwoStagesPipeline:
                 ),
             )
 
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_2_output_shape,
-            conditionings=stage_2_conditionings,
-            noiser=noiser,
-            sigmas=distilled_sigmas,
-            stepper=stepper,
-            denoising_loop_fn=second_stage_denoising_loop,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
-            noise_scale=distilled_sigmas[0],
-            initial_video_latent=upscaled_video_latent,
-            initial_audio_latent=audio_state.latent,
-        )
+        with trace_step("stage_2_denoise"):
+            video_state, audio_state = denoise_audio_video(
+                output_shape=stage_2_output_shape,
+                conditionings=stage_2_conditionings,
+                noiser=noiser,
+                sigmas=distilled_sigmas,
+                stepper=stepper,
+                denoising_loop_fn=second_stage_denoising_loop,
+                components=self.pipeline_components,
+                dtype=dtype,
+                device=self.device,
+                noise_scale=distilled_sigmas[0],
+                initial_video_latent=upscaled_video_latent,
+                initial_audio_latent=audio_state.latent,
+            )
 
-        torch.cuda.synchronize()
         del transformer
         cleanup_memory()
 
-        decoded_video = vae_decode_video(
-            video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
-        )
+        with trace_step("decode_video"):
+            decoded_video = vae_decode_video(
+                video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
+            )
 
         # Return the original input audio instead of VAE-decoded audio to preserve fidelity.
         # decode_audio_from_file already returns normalised [-1, 1] float values.
@@ -329,6 +336,7 @@ def main() -> None:
         audio_path=args.audio_path,
         audio_start_time=args.audio_start_time,
         audio_max_duration=args.audio_max_duration,
+        enhance_prompt=args.enhance_prompt,
     )
 
     encode_video(
