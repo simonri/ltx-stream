@@ -24,7 +24,6 @@ from ltx_pipelines.utils import (
     assert_resolution,
     cleanup_memory,
     combined_image_conditionings,
-    denoise_audio_video,
     encode_prompts,
     euler_denoising_loop,
     get_device,
@@ -34,10 +33,14 @@ from ltx_pipelines.utils import (
 )
 from ltx_pipelines.utils.args import ImageConditioningInput, default_2_stage_arg_parser, detect_checkpoint_path
 from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES, detect_params
+from ltx_pipelines.utils.helpers import denoise_video_only
 from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
 device = get_device()
+
+ADD_BACKGROUND_NOISE = True
+BACKGROUND_NOISE_AMPLITUDE = 0.005
 
 
 class TI2VidTwoStagesPipeline:
@@ -112,13 +115,20 @@ class TI2VidTwoStagesPipeline:
                 self.stage_1_model_ledger,
                 enhance_first_prompt=enhance_prompt,
                 enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-                enhance_prompt_seed=seed,
             )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         with trace_step("encode_audio"):
             decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
+
+            if ADD_BACKGROUND_NOISE:
+                noise = torch.randn_like(decoded_audio.waveform) * BACKGROUND_NOISE_AMPLITUDE
+                decoded_audio = Audio(
+                    waveform=decoded_audio.waveform + noise,
+                    sampling_rate=decoded_audio.sampling_rate,
+                )
+
             encoded_audio_latent = vae_encode_audio(decoded_audio, self.stage_1_model_ledger.audio_encoder())
             audio_shape = AudioLatentShape.from_duration(
                 batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16
@@ -180,7 +190,7 @@ class TI2VidTwoStagesPipeline:
             )
 
         with trace_step("stage_1_denoise"):
-            video_state, audio_state = denoise_audio_video(
+            video_state = denoise_video_only(
                 output_shape=stage_1_output_shape,
                 conditionings=stage_1_conditionings,
                 noiser=noiser,
@@ -239,7 +249,7 @@ class TI2VidTwoStagesPipeline:
             )
 
         with trace_step("stage_2_denoise"):
-            video_state, audio_state = denoise_audio_video(
+            video_state = denoise_video_only(
                 output_shape=stage_2_output_shape,
                 conditionings=stage_2_conditionings,
                 noiser=noiser,
@@ -251,7 +261,7 @@ class TI2VidTwoStagesPipeline:
                 device=self.device,
                 noise_scale=distilled_sigmas[0],
                 initial_video_latent=upscaled_video_latent,
-                initial_audio_latent=audio_state.latent,
+                initial_audio_latent=encoded_audio_latent,
             )
 
         del transformer
@@ -262,9 +272,12 @@ class TI2VidTwoStagesPipeline:
                 video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
             )
 
-        # Return the original input audio instead of VAE-decoded audio to preserve fidelity.
+        # Return the original input audio trimmed to video duration to keep A/V in sync.
         # decode_audio_from_file already returns normalised [-1, 1] float values.
-        original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
+        video_duration = num_frames / frame_rate
+        max_samples = round(video_duration * decoded_audio.sampling_rate)
+        trimmed_waveform = decoded_audio.waveform[:, :, :max_samples].squeeze(0)
+        original_audio = Audio(waveform=trimmed_waveform, sampling_rate=decoded_audio.sampling_rate)
 
         return decoded_video, original_audio
 
@@ -335,7 +348,9 @@ def main() -> None:
         tiling_config=tiling_config,
         audio_path=args.audio_path,
         audio_start_time=args.audio_start_time,
-        audio_max_duration=args.audio_max_duration,
+        audio_max_duration=args.audio_max_duration
+        if args.audio_max_duration is not None
+        else args.num_frames / args.frame_rate,
         enhance_prompt=args.enhance_prompt,
     )
 
