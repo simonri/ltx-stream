@@ -92,8 +92,12 @@ def load_image_conditioning(
     Note: The image is resized to the nearest multiple of 2 for compatibility with video codecs.
     """
     image = decode_image(image_path=image_path)
-    image = preprocess(image=image, crf=crf)
     image = torch.tensor(image, dtype=torch.float32, device=device)
+    image = resize_and_center_crop(image, height, width)
+    # Apply CRF after resize so compression artifacts match the resolution the model sees.
+    image_hwc = rearrange(image, "1 c 1 h w -> h w c").cpu().numpy().astype(np.uint8)
+    image_hwc = preprocess(image=image_hwc, crf=crf)
+    image = torch.tensor(image_hwc, dtype=torch.float32, device=device)
     image = resize_and_center_crop(image, height, width)
     image = normalize_latent(image, device, dtype)
     return image

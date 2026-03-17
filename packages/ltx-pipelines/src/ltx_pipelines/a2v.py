@@ -13,6 +13,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
+from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
@@ -38,10 +39,6 @@ from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
 device = get_device()
-
-ADD_BACKGROUND_NOISE = True
-BACKGROUND_NOISE_AMPLITUDE = 0.005
-
 
 class TI2VidTwoStagesPipeline:
     """
@@ -121,14 +118,6 @@ class TI2VidTwoStagesPipeline:
 
         with trace_step("encode_audio"):
             decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
-
-            if ADD_BACKGROUND_NOISE:
-                noise = torch.randn_like(decoded_audio.waveform) * BACKGROUND_NOISE_AMPLITUDE
-                decoded_audio = Audio(
-                    waveform=decoded_audio.waveform + noise,
-                    sampling_rate=decoded_audio.sampling_rate,
-                )
-
             encoded_audio_latent = vae_encode_audio(decoded_audio, self.stage_1_model_ledger.audio_encoder())
             audio_shape = AudioLatentShape.from_duration(
                 batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16
@@ -264,6 +253,7 @@ class TI2VidTwoStagesPipeline:
                 initial_audio_latent=encoded_audio_latent,
             )
 
+        torch.cuda.synchronize()
         del transformer
         cleanup_memory()
 
@@ -272,19 +262,19 @@ class TI2VidTwoStagesPipeline:
                 video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
             )
 
-        # Return the original input audio trimmed to video duration to keep A/V in sync.
-        # decode_audio_from_file already returns normalised [-1, 1] float values.
-        video_duration = num_frames / frame_rate
-        max_samples = round(video_duration * decoded_audio.sampling_rate)
-        trimmed_waveform = decoded_audio.waveform[:, :, :max_samples].squeeze(0)
-        original_audio = Audio(waveform=trimmed_waveform, sampling_rate=decoded_audio.sampling_rate)
+        with trace_step("decode_audio"):
+            decoded_audio_output = vae_decode_audio(
+                encoded_audio_latent,
+                self.stage_2_model_ledger.audio_decoder(),
+                self.stage_2_model_ledger.vocoder(),
+            )
 
-        return decoded_video, original_audio
+        return decoded_video, decoded_audio_output
 
 
 @torch.inference_mode()
 def main() -> None:
-    logging.getLogger().setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     checkpoint_path = detect_checkpoint_path()
     params = detect_params(checkpoint_path)
     parser = default_2_stage_arg_parser(params=params)
@@ -346,12 +336,12 @@ def main() -> None:
         ),
         images=args.images,
         tiling_config=tiling_config,
+        enhance_prompt=args.enhance_prompt,
         audio_path=args.audio_path,
         audio_start_time=args.audio_start_time,
         audio_max_duration=args.audio_max_duration
         if args.audio_max_duration is not None
         else args.num_frames / args.frame_rate,
-        enhance_prompt=args.enhance_prompt,
     )
 
     encode_video(
