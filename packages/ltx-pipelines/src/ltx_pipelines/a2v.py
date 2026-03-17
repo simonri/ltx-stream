@@ -40,7 +40,9 @@ from ltx_pipelines.utils.types import PipelineComponents
 
 device = get_device()
 
-class TI2VidTwoStagesPipeline:
+SHOULD_CLEANUP_MEMORY = False
+
+class A2VidPipelineTwoStage:
     """
     Two-stage text/image-to-video generation pipeline.
     Stage 1 generates video at half of the target resolution with CFG guidance (assuming
@@ -150,7 +152,8 @@ class TI2VidTwoStagesPipeline:
                 device=self.device,
             )
         del video_encoder
-        cleanup_memory()
+        if SHOULD_CLEANUP_MEMORY:
+            cleanup_memory()
 
         transformer = self.stage_1_model_ledger.transformer()
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
@@ -193,7 +196,8 @@ class TI2VidTwoStagesPipeline:
             )
 
         del transformer
-        cleanup_memory()
+        if SHOULD_CLEANUP_MEMORY:
+            cleanup_memory()
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         with trace_step("stage_2_upsample"):
@@ -217,7 +221,8 @@ class TI2VidTwoStagesPipeline:
                 device=self.device,
             )
         del video_encoder
-        cleanup_memory()
+        if SHOULD_CLEANUP_MEMORY:
+            cleanup_memory()
 
         transformer = self.stage_2_model_ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
@@ -255,7 +260,8 @@ class TI2VidTwoStagesPipeline:
 
         torch.cuda.synchronize()
         del transformer
-        cleanup_memory()
+        if SHOULD_CLEANUP_MEMORY:
+            cleanup_memory()
 
         with trace_step("decode_video"):
             decoded_video = vae_decode_video(
@@ -299,7 +305,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    pipeline = TI2VidTwoStagesPipeline(
+    pipeline = A2VidPipelineTwoStage(
         checkpoint_path=args.checkpoint_path,
         distilled_lora=args.distilled_lora,
         spatial_upsampler_path=args.spatial_upsampler_path,
@@ -325,14 +331,6 @@ def main() -> None:
             modality_scale=args.a2v_guidance_scale,
             skip_step=args.video_skip_step,
             stg_blocks=args.video_stg_blocks,
-        ),
-        audio_guider_params=MultiModalGuiderParams(
-            cfg_scale=args.audio_cfg_guidance_scale,
-            stg_scale=args.audio_stg_guidance_scale,
-            rescale_scale=args.audio_rescale_scale,
-            modality_scale=args.v2a_guidance_scale,
-            skip_step=args.audio_skip_step,
-            stg_blocks=args.audio_stg_blocks,
         ),
         images=args.images,
         tiling_config=tiling_config,
